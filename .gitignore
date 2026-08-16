@@ -14,6 +14,10 @@ venv.bak/
 dist/
 build/
 *.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+*.pyc
 
 # Node/Frontend
 node_modules/
@@ -26,16 +30,19 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .DS_Store
+dist/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*.code-workspace
 
 # Project specific
 backend/indices/
 backend/temp_*
+backend/null
 *.index
 *.meta
 *.bin
@@ -48,3 +55,19 @@ backend/temp_*
 # Logs
 *.log
 logs/
+
+# Testing
+coverage.xml
+.pytest_cache/
+
+# Temporary files
+*.bak
+*.tmp
+*.old
+*.new
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
