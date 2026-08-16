@@ -1,0 +1,92 @@
+name: Code Quality Checks
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  lint-backend:
+    name: Backend Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v3
+      
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: 📦 Install Linting Tools
+        run: |
+          pip install flake8 black isort
+      
+      - name: 🔍 Check Code Formatting (Black)
+        working-directory: ./backend
+        run: |
+          black --check app/ tests/ || echo "Run 'black app/ tests/' to fix formatting"
+        continue-on-error: true
+      
+      - name: 🔍 Check Import Order (isort)
+        working-directory: ./backend
+        run: |
+          isort --check-only app/ tests/ || echo "Run 'isort app/ tests/' to fix imports"
+        continue-on-error: true
+      
+      - name: 🔍 Lint Code (Flake8)
+        working-directory: ./backend
+        run: |
+          flake8 app/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 app/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+  lint-frontend:
+    name: Frontend Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v3
+      
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: 📥 Install Dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: 🔍 Run ESLint
+        working-directory: ./frontend
+        run: npm run lint
+        continue-on-error: true
+      
+      - name: 🔍 Type Check
+        working-directory: ./frontend
+        run: npm run typecheck
+        continue-on-error: true
+
+  security-check:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v3
+      
+      - name: 🔒 Run Security Scan (Backend)
+        working-directory: ./backend
+        run: |
+          pip install safety
+          safety check --file=requirements.txt || echo "Security vulnerabilities found"
+        continue-on-error: true
+      
+      - name: 🔒 Run Security Scan (Frontend)
+        working-directory: ./frontend
+        run: npm audit || echo "Security vulnerabilities found"
+        continue-on-error: true

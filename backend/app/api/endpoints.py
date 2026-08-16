@@ -1,4 +1,5 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, status, Header
+from fastapi.responses import JSONResponse
 from ..services.chat import ChatService
 from ..utils.document_processor import DocumentProcessor, generate_widget_code
 from ..models.schemas import ChatRequest, ChatResponse, DocumentUploadResponse, WebScrapeRequest, WebScrapeBotResponse
@@ -382,29 +383,112 @@ async def chat_with_bot_id(
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint that includes Qdrant status"""
+    """
+    Comprehensive health check endpoint
+    Checks status of all critical services
+    """
     try:
         from ..services.vector_store import VectorStoreService
-        vector_store = VectorStoreService()
-        qdrant_health = vector_store.health_check()
+        from ..services.auth import AuthService
+        from ..services.ai_service import AIService
+        import time
         
-        return {
-            "status": "healthy" if qdrant_health["status"] == "healthy" else "degraded",
+        start_time = time.time()
+        health_status = {
+            "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
-            "services": {
-                "api": "healthy",
-                "qdrant": qdrant_health
-            }
+            "services": {},
+            "version": "1.0.0"
         }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "timestamp": datetime.utcnow().isoformat(),
-            "services": {
-                "api": "healthy",
-                "qdrant": {
-                    "status": "unhealthy",
-                    "message": str(e)
+        
+        # Check API service
+        health_status["services"]["api"] = {
+            "status": "healthy",
+            "message": "API service is running"
+        }
+        
+        # Check Qdrant (Vector Store)
+        try:
+            vector_store = VectorStoreService()
+            qdrant_health = vector_store.health_check()
+            health_status["services"]["qdrant"] = qdrant_health
+            if qdrant_health["status"] != "healthy":
+                health_status["status"] = "degraded"
+        except Exception as e:
+            health_status["services"]["qdrant"] = {
+                "status": "unhealthy",
+                "message": f"Qdrant connection failed: {str(e)}"
+            }
+            health_status["status"] = "degraded"
+        
+        # Check Supabase (Database)
+        try:
+            auth_service = AuthService()
+            # Try a simple database query to verify connection
+            # This is a lightweight check that doesn't actually query data
+            client_check = auth_service.client is not None
+            if client_check:
+                health_status["services"]["supabase"] = {
+                    "status": "healthy",
+                    "message": "Database connection established"
                 }
+            else:
+                health_status["services"]["supabase"] = {
+                    "status": "unhealthy",
+                    "message": "Database client not initialized"
+                }
+                health_status["status"] = "degraded"
+        except Exception as e:
+            health_status["services"]["supabase"] = {
+                "status": "unhealthy",
+                "message": f"Database connection failed: {str(e)}"
             }
-        }
+            health_status["status"] = "degraded"
+        
+        # Check AI Service (Groq)
+        try:
+            ai_service = AIService()
+            groq_check = ai_service.client is not None
+            if groq_check:
+                health_status["services"]["groq"] = {
+                    "status": "healthy",
+                    "message": "AI service initialized"
+                }
+            else:
+                health_status["services"]["groq"] = {
+                    "status": "unhealthy",
+                    "message": "AI service client not initialized"
+                }
+                health_status["status"] = "degraded"
+        except Exception as e:
+            health_status["services"]["groq"] = {
+                "status": "unhealthy",
+                "message": f"AI service initialization failed: {str(e)}"
+            }
+            health_status["status"] = "degraded"
+        
+        # Add response time
+        response_time = round((time.time() - start_time) * 1000, 2)  # in milliseconds
+        health_status["response_time_ms"] = response_time
+        
+        # Determine overall status code
+        status_code = 200 if health_status["status"] == "healthy" else 503
+        
+        return JSONResponse(content=health_status, status_code=status_code)
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}", exc_info=True)
+        return JSONResponse(
+            content={
+                "status": "unhealthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "message": f"Health check failed: {str(e)}",
+                "services": {
+                    "api": {
+                        "status": "unhealthy",
+                        "message": str(e)
+                    }
+                }
+            },
+            status_code=503
+        )

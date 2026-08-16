@@ -47,7 +47,7 @@ class WebScraperService:
     """Crawl a website and extract structured text chunks."""
 
     def __init__(self):
-        self.doc_processor = DocumentProcessor(chunk_size=1000, chunk_overlap=200)
+        self.doc_processor = DocumentProcessor(chunk_size=1500, chunk_overlap=250)
 
     # ══════════════════════════════════════════════════════════
     #  PUBLIC API

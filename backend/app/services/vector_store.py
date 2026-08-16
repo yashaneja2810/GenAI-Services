@@ -17,17 +17,18 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # ── Tuning knobs ──────────────────────────────────────────────
-EMBED_BATCH_SIZE = 64          # texts per SentenceTransformer.encode() call
-UPSERT_BATCH_SIZE = 50         # points per Qdrant upsert() call
+EMBED_BATCH_SIZE = 256         # texts per SentenceTransformer.encode() call
+UPSERT_BATCH_SIZE = 200        # points per Qdrant upsert() call (reduce round-trips)
 QDRANT_TIMEOUT = 120           # seconds – cloud free-tier can be slow
-UPSERT_RETRY_COUNT = 4         # retries per micro-batch upsert
-UPSERT_RETRY_DELAY = 2        # initial backoff in seconds
+UPSERT_RETRY_COUNT = 3         # retries per micro-batch upsert
+UPSERT_RETRY_DELAY = 1         # initial backoff in seconds
 # ──────────────────────────────────────────────────────────────
 
 
 class VectorStoreService:
     _instance = None
     _lock = Lock()
+    _known_collections: set = set()  # Cache to avoid redundant HTTP checks
 
     def __new__(cls):
         if cls._instance is None:
@@ -87,11 +88,16 @@ class VectorStoreService:
             raise Exception(f"Failed to initialize Qdrant client: {str(e)}")
         
     def create_collection(self, collection_name: str):
-        """Create a new Qdrant collection (idempotent)"""
+        """Create a new Qdrant collection (idempotent, cached)"""
+        # Fast path: skip HTTP if we already verified this collection
+        if collection_name in self._known_collections:
+            return
+
         try:
             try:
                 self.client.get_collection(collection_name)
                 logger.info(f"Collection {collection_name} already exists")
+                self._known_collections.add(collection_name)
                 return
             except Exception:
                 pass
@@ -104,24 +110,27 @@ class VectorStoreService:
                 ),
             )
             logger.info(f"Created collection: {collection_name}")
+            self._known_collections.add(collection_name)
             
         except Exception as e:
             if "already exists" in str(e).lower():
                 logger.info(f"Collection {collection_name} already exists (race condition)")
+                self._known_collections.add(collection_name)
                 return
             logger.error(f"Failed to create collection {collection_name}: {str(e)}")
             raise
 
-    # ── Core improvement: batched encode + batched upsert ──────
+    # ── Pipelined encode + upsert ──────────────────────────────
     def add_texts(self, collection_name: str, texts: List[str], metadata: List[Dict] = None):
         """
         Add text chunks to the collection.
 
-        Processes in two phases:
-          1. Encode embeddings in batches of EMBED_BATCH_SIZE
-          2. Upsert points in batches of UPSERT_BATCH_SIZE
-        Each upsert micro-batch is retried independently.
+        Uses a pipelined approach: while batch N is being upserted
+        over the network, batch N+1 is already encoding on the CPU.
+        This overlaps CPU work with network I/O for significant speedup.
         """
+        from concurrent.futures import ThreadPoolExecutor, Future
+
         if not texts:
             logger.warning("No texts provided to add_texts")
             return
@@ -129,47 +138,62 @@ class VectorStoreService:
         total = len(texts)
         logger.info(f"add_texts: {total} texts → collection {collection_name}")
 
-        # Ensure collection exists
+        # Ensure collection exists (cached — instant after first call)
         self.create_collection(collection_name)
 
-        # ── Phase 1: generate embeddings in batches ────────────
-        logger.info(f"Phase 1/2: encoding {total} texts (batch_size={EMBED_BATCH_SIZE})")
-        all_embeddings = []
-        for start in range(0, total, EMBED_BATCH_SIZE):
-            end = min(start + EMBED_BATCH_SIZE, total)
-            batch_texts = texts[start:end]
-            batch_embeddings = self.model.encode(batch_texts, show_progress_bar=False)
-            all_embeddings.extend(batch_embeddings)
-            logger.info(f"  Encoded batch {start}-{end} of {total}")
-
-        # ── Phase 2: build points then upsert in batches ───────
-        logger.info(f"Phase 2/2: upserting {total} points (batch_size={UPSERT_BATCH_SIZE})")
-        points = []
-        for i, (text, embedding) in enumerate(zip(texts, all_embeddings)):
-            payload = {
-                "text": text,
-                "created_at": datetime.utcnow().isoformat(),
-            }
-            if metadata and i < len(metadata):
-                payload.update(metadata[i])
-
-            points.append(
-                PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=embedding.tolist(),
-                    payload=payload,
-                )
-            )
-
+        now_iso = datetime.utcnow().isoformat()
         upserted = 0
-        for start in range(0, len(points), UPSERT_BATCH_SIZE):
-            end = min(start + UPSERT_BATCH_SIZE, len(points))
-            batch = points[start:end]
-            self._upsert_with_retry(collection_name, batch)
-            upserted += len(batch)
-            logger.info(f"  Upserted {upserted}/{total} points")
+        pending_future: Future = None
+
+        # Single background thread for upserting while we encode the next batch
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="qdrant-upsert") as executor:
+            for batch_start in range(0, total, EMBED_BATCH_SIZE):
+                batch_end = min(batch_start + EMBED_BATCH_SIZE, total)
+                batch_texts = texts[batch_start:batch_end]
+
+                # ── Encode this batch (CPU-bound) ──────────────
+                embeddings = self.model.encode(
+                    batch_texts,
+                    show_progress_bar=False,
+                    normalize_embeddings=True,   # pre-normalize for COSINE
+                )
+                logger.info(f"  Encoded {batch_start}-{batch_end} of {total}")
+
+                # ── Build PointStruct list ─────────────────────
+                points = []
+                for i in range(len(batch_texts)):
+                    global_i = batch_start + i
+                    payload = {"text": batch_texts[i], "created_at": now_iso}
+                    if metadata and global_i < len(metadata):
+                        payload.update(metadata[global_i])
+                    points.append(PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=embeddings[i].tolist(),
+                        payload=payload,
+                    ))
+
+                # ── Wait for previous upsert to finish ─────────
+                if pending_future is not None:
+                    pending_future.result()  # raises if the upsert failed
+
+                # ── Fire off this upsert in background ─────────
+                pending_future = executor.submit(
+                    self._upsert_batch_points, collection_name, points,
+                )
+                upserted += len(points)
+                logger.info(f"  Queued upsert {upserted}/{total} points")
+
+            # Wait for the very last upsert to complete
+            if pending_future is not None:
+                pending_future.result()
 
         logger.info(f"✓ add_texts complete: {total} texts → {collection_name}")
+
+    def _upsert_batch_points(self, collection_name: str, points: List[PointStruct]):
+        """Upsert a batch of points, splitting into sub-batches of UPSERT_BATCH_SIZE."""
+        for start in range(0, len(points), UPSERT_BATCH_SIZE):
+            end = min(start + UPSERT_BATCH_SIZE, len(points))
+            self._upsert_with_retry(collection_name, points[start:end])
 
     def _upsert_with_retry(self, collection_name: str, points: List[PointStruct]):
         """Upsert a single micro-batch with exponential backoff retries."""
@@ -179,6 +203,7 @@ class VectorStoreService:
                 self.client.upsert(
                     collection_name=collection_name,
                     points=points,
+                    wait=False,  # Don't block until indexed — huge speedup on cloud
                 )
                 return
             except Exception as e:
@@ -198,6 +223,7 @@ class VectorStoreService:
         """Delete a Qdrant collection"""
         try:
             result = self.client.delete_collection(collection_name)
+            self._known_collections.discard(collection_name)
             logger.info(f"Deleted collection: {collection_name}")
             return result
         except Exception as e:
@@ -219,8 +245,8 @@ class VectorStoreService:
                 logger.warning(f"Collection {collection_name} does not exist or is empty")
                 return []
             
-            # Encode the query to get vector
-            query_vector = self.model.encode([query])[0]
+            # Encode the query to get vector (must match insertion normalization)
+            query_vector = self.model.encode([query], normalize_embeddings=True)[0]
             
             # Use query_points API instead of search
             search_result = self.client.query_points(

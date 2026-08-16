@@ -5,6 +5,7 @@ from datetime import datetime
 from fastapi import HTTPException, status
 from ..log_config import logger
 from ..core.config import get_settings
+from ..core.errors import BotAccessDeniedError, BotNotFoundError, AIServiceError
 from .vector_store import VectorStoreService
 from .auth import AuthService
 from .ai_service import AIService
@@ -63,10 +64,7 @@ class ChatService:
             
             if not matching_bot:
                 logger.error(f"Bot {bot_id} not found in user's bots. Available bots: {[b.get('bot_id', 'N/A') for b in bots]}")
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied for this bot"
-                )
+                raise BotAccessDeniedError(bot_id)
                 
             logger.info(f"Access verified for bot {bot_id}. Bot details: {matching_bot}")
             return matching_bot
@@ -176,13 +174,10 @@ class ChatService:
                 logger.warning(f"No search results for bot {bot_id}, query: {query}")
             
             context_chunks = []
-            for result in results[:5]:
-                text = result.get("text", "")
-                if text.strip():
-                    context_chunks.append(text.strip())
-
-            if len(context_chunks) < 5 and len(results) > 5:
-                for result in results[5:10]:
+            # Only include chunks that have a decent similarity score (Cosine distance)
+            for result in results:
+                score = result.get("score", 0.0)
+                if score >= 0.35:  # Threshold to filter out irrelevant matches
                     text = result.get("text", "")
                     if text.strip():
                         context_chunks.append(text.strip())
@@ -196,16 +191,19 @@ class ChatService:
                 if context:
                     knowledge_context = f"""Bot name: {bot_name}
 
-Use the following retrieved bot knowledge as the primary source of truth:
+You have retrieved the following bot knowledge from the database:
 {context}
 
-When the knowledge is relevant, answer from it directly and combine related chunks.
-Do not mention retrieval, embeddings, or internal database details in the final answer.
-Format the answer with markdown when it improves readability."""
+Instructions:
+1. If the user's input is a simple greeting (like 'hi', 'hello', 'hey'), respond naturally with a helpful greeting and ask how you can assist them. DO NOT use the retrieved knowledge for simple greetings.
+2. For all other queries, if the knowledge is relevant to the user's query, answer from it directly and combine related chunks.
+3. If the knowledge is completely irrelevant to the user's query, just answer naturally or say you don't have information about that.
+4. Do not mention retrieval, embeddings, or internal database details in the final answer.
+5. Format the answer with markdown when it improves readability."""
                 else:
                     knowledge_context = f"""Bot name: {bot_name}
 
-No indexed knowledge is available for this bot yet.
+No indexed knowledge is available or relevant for this query.
 Answer naturally and do not pretend to have retrieved bot-specific information."""
 
                 response_text = await self.ai_service.generate_response(query, context=knowledge_context)
@@ -227,11 +225,10 @@ Answer naturally and do not pretend to have retrieved bot-specific information."
         """
         Process and store document chunks in vector store.
 
-        Sends chunks in batches of PROCESS_BATCH to add_texts, which
-        itself handles micro-batch upserts and per-batch retries.
+        Delegates all encoding + upserting to add_texts (which handles
+        its own internal batching and retries) and runs it in a thread
+        so the FastAPI event loop is never blocked.
         """
-        PROCESS_BATCH = 100  # chunks per add_texts call
-
         try:
             collection_name = self._get_collection_name(bot_id)
             total = len(texts)
@@ -267,13 +264,14 @@ Answer naturally and do not pretend to have retrieved bot-specific information."
 
                 metadata.append(chunk_meta)
 
-            # Feed to vector store in manageable batches
-            for start in range(0, total, PROCESS_BATCH):
-                end = min(start + PROCESS_BATCH, total)
-                batch_texts = texts[start:end]
-                batch_meta = metadata[start:end]
-                logger.info(f"  Sending batch {start}-{end} of {total} to add_texts")
-                self.vector_store.add_texts(collection_name, batch_texts, batch_meta)
+            # Run the blocking encode+upsert in a worker thread so
+            # the FastAPI event loop stays responsive.
+            await asyncio.to_thread(
+                self.vector_store.add_texts,
+                collection_name,
+                texts,
+                metadata,
+            )
 
             logger.info(f"✓ process_documents complete: {total} chunks stored for bot {bot_id}")
 

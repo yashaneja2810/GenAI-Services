@@ -1,0 +1,102 @@
+# GitLab CI/CD Pipeline Configuration
+# This is an alternative to GitHub Actions for GitLab users
+
+stages:
+  - test
+  - quality
+  - deploy
+
+variables:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "18"
+
+# Backend Testing
+test:backend:
+  stage: test
+  image: python:${PYTHON_VERSION}
+  
+  before_script:
+    - cd backend
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install -r requirements-dev.txt
+  
+  script:
+    - pytest --cov=app --cov-report=xml --cov-report=term-missing
+  
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: backend/coverage.xml
+  
+  only:
+    changes:
+      - backend/**/*
+      - .gitlab-ci.yml
+
+# Code Quality
+quality:backend:
+  stage: quality
+  image: python:${PYTHON_VERSION}
+  
+  before_script:
+    - pip install flake8 black isort
+  
+  script:
+    - cd backend
+    - black --check app/ tests/
+    - isort --check-only app/ tests/
+    - flake8 app/ tests/ --max-line-length=127
+  
+  allow_failure: true
+  only:
+    changes:
+      - backend/**/*
+
+quality:frontend:
+  stage: quality
+  image: node:${NODE_VERSION}
+  
+  before_script:
+    - cd frontend
+    - npm ci
+  
+  script:
+    - npm run lint
+    - npm run typecheck
+  
+  allow_failure: true
+  only:
+    changes:
+      - frontend/**/*
+
+# Deploy to Production (Render)
+deploy:backend:
+  stage: deploy
+  image: curlimages/curl:latest
+  
+  script:
+    - curl -X POST "$RENDER_DEPLOY_HOOK_URL"
+  
+  only:
+    - main
+  when: manual  # Require manual approval
+
+# Deploy Frontend (Vercel)
+deploy:frontend:
+  stage: deploy
+  image: node:${NODE_VERSION}
+  
+  before_script:
+    - npm install -g vercel
+  
+  script:
+    - cd frontend
+    - vercel deploy --prod --token=$VERCEL_TOKEN
+  
+  only:
+    - main
+  when: manual  # Require manual approval
